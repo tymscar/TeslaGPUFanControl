@@ -2,6 +2,8 @@ version: '1'
 domains:
   - rust
   - overstory
+  - meta
+  - packaging
 governance:
   max_entries: 100
   warn_entries: 150
