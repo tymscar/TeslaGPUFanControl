@@ -683,6 +683,21 @@ The mode is read-only with respect to disk state and idempotent. Safe to run rep
 
 The architecture splits cleanly into pure and I/O modules (ADR-0006), and the test strategy follows that split.
 
+### Workflow: where TDD applies, where it doesn't
+
+TDD (red-green-refactor) is mandated where the test surface is high-leverage and naturally precedes implementation; for I/O glue and the composition root it's left as test-after, where writing tests first tends to produce contrived setups before the real I/O shape is known.
+
+| Module | Workflow | Why |
+|---|---|---|
+| `units.rs`, `curve.rs`, `group.rs` | **Strict TDD** — red-green-refactor each function | Pure, deterministic; the test *is* the spec. Fastest feedback loop in the project. |
+| `watchdog::FaultTracker` | **Strict TDD** | Most safety-critical pure code; branch coverage is the goal and TDD makes that natural. |
+| `config::validation` | **Strict TDD, one test per rule** | The S/G/F/W/T validation table maps one-to-one onto `#[test]` functions. Each rule's failing test comes first, then the validator code grows to make it pass. |
+| `fan.rs`, `chip.rs` | **Spike then test** — write the API and one happy-path tempfile test, then iterate | TDD against sysfs tends to produce contrived test trees before the real I/O shape is known. |
+| `nvml.rs`, `watchdog::HardwareWatchdog` | **Test after** | Thin shims; integration tests against `FakeNvml` and `softdog` are what matter, and those don't fit a red-green loop well. |
+| `main.rs` | **No TDD** — smoke tests written last | Composition root; TDD doesn't apply meaningfully. |
+
+The strict-TDD modules cover every interesting logical decision in the system. By the end of Phase 3 (Logic), the validation rule set, fan curve, group target computation, and fault tracker should each have ≥ 1 test per code path before any of them have implementations.
+
 ### Pure modules — in-module unit tests
 
 `units.rs`, `curve.rs`, `group.rs`, `watchdog::FaultTracker`, `config::validation`. Tested via `#[cfg(test)] mod tests`. No fixtures, no mocks, just call functions with values and assert.
