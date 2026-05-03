@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo registry and target/
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release (musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Compute sha256 checksum
+        run: |
+          cd target/x86_64-unknown-linux-musl/release
+          sha256sum tesla_fan_control > tesla_fan_control.sha256
+          cat tesla_fan_control.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/x86_64-unknown-linux-musl/release/tesla_fan_control
+            target/x86_64-unknown-linux-musl/release/tesla_fan_control.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
