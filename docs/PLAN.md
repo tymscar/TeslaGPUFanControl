@@ -290,7 +290,7 @@ Both phases **accumulate every violation before exiting**. Validation is a singl
 
 ### `nvml.rs`
 - Wraps `nvml_wrapper::Nvml`. Holds the singleton `Nvml` handle and a `Vec<Device<'_>>` keyed by `nvml_index`.
-- `read_temp(idx) -> Result<Celsius, NvmlError>` — returns `Celsius(device.temperature(TemperatureSensor::Gpu)? as i16)`.
+- `read_temp(idx) -> Result<Celsius, NvmlError>` — calls `device.temperature(TemperatureSensor::Gpu)` and **applies a sanity-bounds check**: any value outside `[5, 110] °C` is treated as if NVML had errored (returns `Err(NvmlError::OutOfBounds)`). This guards against driver bugs or sensor misreads that return `0` (which would silently idle the fan while the GPU overheats) or absurdly high values (which would peg the fan but indicate the temp itself is unreliable). The out-of-bounds error counts toward `gpu_fail_threshold` like any other read failure.
 - Init failure is fatal at startup per ADR-0003 step 3. The realistic failure modes are: `libnvidia-ml.so.1` not present (driver not installed), driver present but its kernel module not loaded, or the configured `nvml_index` exceeds the device count. `nvidia-persistenced` not running is *not* a failure mode — its absence only adds latency to the next `nvmlInit` after idle, which we avoid by keeping NVML open continuously.
 
 ### `chip.rs`
@@ -305,7 +305,7 @@ Both phases **accumulate every violation before exiting**. Validation is a singl
 - `Fan::set_max()` — writes `Pwm(255)` directly, bypassing curve / clamp logic. The fault-handling primitive.
 - `Fan::read_rpm() -> Result<u32>` — reads `fanN_input`.
 - `Fan::check_health(rpm, min, max, in_spin_up) -> FanHealth { Ok | SpinUp | Stalled | Overspeed }` — pure function; tested in isolation. `SpinUp` is returned in place of `Stalled` while the fan is in its spin-up grace window; the `FaultTracker` ignores `SpinUp` instead of counting it.
-- Spin-up state machine: enter spin-up on `take_manual_control()`, or when a `set(Pct)` call increases duty by more than 20 percentage points (configurable). Leave spin-up the moment RPM > `min_rpm` for one poll. If RPM never crosses `min_rpm` within `spin_up_grace_s`, exit spin-up state and the next poll's `Stalled` reading is real.
+- Spin-up state machine: enter spin-up on `take_manual_control()`, or when a `set(Pct)` call increases duty by more than 20 percentage points (`SPIN_UP_DELTA_PCT`, hard-coded constant in v0.1; promote to per-fan config field if a real fan ever needs different). Leave spin-up the moment RPM > `min_rpm` for one poll. If RPM never crosses `min_rpm` within `spin_up_grace_s`, exit spin-up state and the next poll's `Stalled` reading is real.
 - `Fan::restore()` — writes the *startup snapshot* of `pwm_enable` back to the register on graceful shutdown. Restores whatever value the daemon found there (BIOS auto, chip thermal cruise, manual-from-prior-tool, etc.) without needing a per-chip mapping table. Called *before* disarming the watchdog (ADR-0003 inverse invariant). See "Fan restore policy" below.
 
 **Fan restore policy.** `pwm_enable=2` is *not* universally "auto" across chip families:
@@ -512,6 +512,18 @@ PIDFile=/run/tesla_fan_control.pid
 # never be dropped. Volume is bounded (~10 evts/s worst case).
 LogRateLimitIntervalSec=0
 LogRateLimitBurst=0
+
+# Sandboxing — the daemon needs root for sysfs and /dev/watchdog access,
+# but everything else can be locked down. Free hardening, ~zero runtime cost.
+ProtectSystem=strict                                # / and /usr read-only
+ProtectHome=true                                    # /home, /root invisible
+PrivateTmp=true                                     # private /tmp
+NoNewPrivileges=true                                # cannot gain caps via setuid
+ProtectKernelLogs=true                              # cannot read kernel ring buffer
+ProtectControlGroups=true                           # cannot manipulate cgroups
+RestrictAddressFamilies=AF_UNIX AF_NETLINK          # no network sockets
+                                                    # (AF_UNIX kept for sd_notify)
+ReadWritePaths=/sys/class/hwmon /dev /run           # the only paths we write
 
 [Install]
 WantedBy=multi-user.target
@@ -854,6 +866,22 @@ Anyone (including you, six months later) who clones and builds gets the exact co
 ### Config schema versioning
 
 The `[global].config_version` field is mandatory. The daemon's parser refuses to start if the value is unknown to it. Bumping the daemon's major version may require bumping `config_version`; migrations are documented in `CHANGELOG.md` and `README.md`. v0.1.0 ships with `config_version = 1`.
+
+---
+
+## Known considerations (deferred)
+
+Items recognised during the design phase but deliberately not addressed in v0.1. Documented here so future contributors don't reinvent the consideration without context.
+
+### Curve hysteresis
+
+Linear interpolation between curve points reduces fan oscillation near inflection points but does not eliminate it. A GPU bouncing between e.g. 70 °C and 71 °C with a `70:80` curve point will produce small but visible PWM oscillation around 80%. Possible mitigations include:
+
+- A minimum-PWM-delta threshold: do not write a new PWM value unless it differs from the last write by more than N units.
+- Explicit hysteresis windows on each curve segment: enter the segment at temp T, exit at T − Δ.
+- An EMA filter on the temperature reading.
+
+YAGNI for v0.1 — see if it's a real problem on real hardware first. If a user reports audible fan oscillation in field use, the minimum-delta-threshold mitigation is the smallest change with the most impact.
 
 ---
 
