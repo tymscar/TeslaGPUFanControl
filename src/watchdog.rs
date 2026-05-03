@@ -112,8 +112,113 @@ impl FaultTracker {
     }
 }
 
-/// Wave 2 — real ioctl impl pending.
-pub struct HardwareWatchdog;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum WatchdogError {
+    #[error("failed to open watchdog device {path:?}: {source}")]
+    Open {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("WDIOC_SETTIMEOUT failed: {0}")]
+    SetTimeout(nix::errno::Errno),
+    #[error("failed to feed watchdog: {0}")]
+    Feed(std::io::Error),
+    #[error("failed to disarm watchdog: {0}")]
+    Disarm(std::io::Error),
+}
+
+// _IOWR('W', 6, int) — see <linux/watchdog.h>. The kernel reads the requested
+// timeout and writes back the value it actually accepted (often clamped).
+nix::ioctl_readwrite!(wdioc_set_timeout, b'W', 6, nix::libc::c_int);
+
+enum WatchdogState {
+    Enabled { file: File, accepted_timeout_s: u32 },
+    Disabled,
+}
+
+pub struct HardwareWatchdog {
+    inner: WatchdogState,
+}
+
+impl HardwareWatchdog {
+    pub fn open(device: &Path, timeout_s: u32) -> Result<Self, WatchdogError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(device)
+            .map_err(|source| WatchdogError::Open {
+                path: device.to_path_buf(),
+                source,
+            })?;
+
+        let mut timeout = timeout_s as nix::libc::c_int;
+        // SAFETY: ADR-0007 — the sole permitted unsafe block in this crate.
+        // `wdioc_set_timeout` requires a valid fd (we just opened `file`) and a
+        // pointer to a writable `c_int` (the local `timeout`). Both invariants
+        // hold for the duration of the call.
+        unsafe { wdioc_set_timeout(file.as_raw_fd(), &mut timeout) }
+            .map_err(WatchdogError::SetTimeout)?;
+        let accepted_timeout_s = timeout as u32;
+
+        tracing::info!(
+            requested_timeout_s = timeout_s,
+            accepted_timeout_s,
+            device = %device.display(),
+            "watchdog armed"
+        );
+
+        Ok(Self {
+            inner: WatchdogState::Enabled {
+                file,
+                accepted_timeout_s,
+            },
+        })
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            inner: WatchdogState::Disabled,
+        }
+    }
+
+    pub fn feed(&mut self) -> Result<(), WatchdogError> {
+        match &mut self.inner {
+            WatchdogState::Enabled { file, .. } => {
+                file.write_all(&[0u8]).map_err(WatchdogError::Feed)
+            }
+            WatchdogState::Disabled => Ok(()),
+        }
+    }
+
+    pub fn disarm_and_close(self) -> Result<(), WatchdogError> {
+        match self.inner {
+            WatchdogState::Enabled { mut file, .. } => {
+                // The magic 'V' byte tells the kernel not to reboot when the fd
+                // closes (PLAN.md L340). It must be written BEFORE the file is
+                // dropped; without it, the kernel reboots after timeout_s.
+                file.write_all(b"V").map_err(WatchdogError::Disarm)?;
+                drop(file);
+                Ok(())
+            }
+            WatchdogState::Disabled => Ok(()),
+        }
+    }
+
+    pub fn accepted_timeout_s(&self) -> Option<u32> {
+        match &self.inner {
+            WatchdogState::Enabled {
+                accepted_timeout_s, ..
+            } => Some(*accepted_timeout_s),
+            WatchdogState::Disabled => None,
+        }
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
@@ -225,5 +330,40 @@ mod tests {
         t.tick_gpu("g0", true);
         t.tick_fan("f0", FanHealth::Ok, 1500);
         assert!(t.any_fault());
+    }
+
+    #[test]
+    fn disabled_watchdog_feed_is_noop() {
+        let mut wd = HardwareWatchdog::disabled();
+        assert!(wd.feed().is_ok());
+    }
+
+    #[test]
+    fn disabled_watchdog_disarm_is_noop() {
+        let wd = HardwareWatchdog::disabled();
+        assert!(wd.disarm_and_close().is_ok());
+    }
+
+    #[test]
+    fn disabled_watchdog_has_no_accepted_timeout() {
+        let wd = HardwareWatchdog::disabled();
+        assert_eq!(wd.accepted_timeout_s(), None);
+    }
+
+    #[test]
+    #[ignore] // requires modprobe softdog; CI cannot reliably load kernel modules.
+    fn watchdog_open_feed_disarm_lifecycle() {
+        use std::thread;
+        use std::time::Duration;
+
+        let mut wd = HardwareWatchdog::open(Path::new("/dev/watchdog"), 5).unwrap();
+        let accepted = wd.accepted_timeout_s().unwrap();
+        assert!((5..=600).contains(&accepted));
+        for _ in 0..3 {
+            wd.feed().unwrap();
+            thread::sleep(Duration::from_millis(500));
+        }
+        wd.disarm_and_close().unwrap();
+        // If we got here without rebooting, the lifecycle is correct.
     }
 }
