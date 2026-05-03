@@ -1,0 +1,33 @@
+[Unit]
+Description=Tesla GPU Fan Control Daemon
+After=nvidia-persistenced.service
+
+[Service]
+Type=notify
+ExecStart=/usr/local/sbin/tesla_fan_control
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5s
+WatchdogSec=30s
+PIDFile=/run/tesla_fan_control.pid
+
+# Disable per-service journal rate limiting — pre-reboot fault messages
+# are the single most important records this daemon emits and must
+# never be dropped. Volume is bounded (~10 evts/s worst case).
+LogRateLimitIntervalSec=0
+LogRateLimitBurst=0
+
+# Sandboxing — the daemon needs root for sysfs and /dev/watchdog access,
+# but everything else can be locked down. Free hardening, ~zero runtime cost.
+ProtectSystem=strict                                # / and /usr read-only
+ProtectHome=true                                    # /home, /root invisible
+PrivateTmp=true                                     # private /tmp
+NoNewPrivileges=true                                # cannot gain caps via setuid
+ProtectKernelLogs=true                              # cannot read kernel ring buffer
+ProtectControlGroups=true                           # cannot manipulate cgroups
+RestrictAddressFamilies=AF_UNIX AF_NETLINK          # no network sockets
+                                                    # (AF_UNIX kept for sd_notify)
+ReadWritePaths=/sys/class/hwmon /dev /run           # the only paths we write
+
+[Install]
+WantedBy=multi-user.target
