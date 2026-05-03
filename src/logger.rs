@@ -20,6 +20,9 @@ pub enum LoggerError {
     #[error("failed to open log file: {0}")]
     LogFile(#[from] std::io::Error),
     #[error("failed to connect to journald: {0}")]
+    // Reserved for the strict-journald path; the current init() falls back
+    // to stderr on journald failure rather than returning this variant.
+    #[allow(dead_code)]
     Journald(String),
 }
 
