@@ -1,0 +1,31 @@
+# Mulch configuration. See https://github.com/jayminwest/mulch for docs.
+#
+# Required fields below. Optional knobs are commented out at the bottom — uncomment
+# to enable. Note: commands that mutate this file (e.g. `ml add <domain>`,
+# `ml record` auto-creating a domain) rewrite it via the YAML serializer and
+# strip these comments.
+
+version: '1'
+domains: []
+governance:
+  max_entries: 100
+  warn_entries: 150
+  hard_limit: 200
+classification_defaults:
+  shelf_life:
+    tactical: 14
+    observational: 30
+
+# ─── Optional knobs (uncomment to enable) ────────────────────────────────────
+#
+# prime:
+#   # Switch `ml prime` from dumping all records to emitting a manifest
+#   # (quick-reference + domain index). Useful in large monoliths — agents
+#   # scope-load with `ml prime <domain>` or `ml prime --files <path>`.
+#   default_mode: manifest    # one of: full (default), manifest
+#
+# search:
+#   # Multiplier applied to BM25 scores so records with more confirmed outcomes
+#   # rank higher. 0 disables (pure BM25). Default 0.1: a record with N successes
+#   # gets a (1 + 0.1*N) boost. Override per-call with `ml search --no-boost`.
+#   boost_factor: 0.1
