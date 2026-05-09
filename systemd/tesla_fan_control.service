@@ -11,6 +11,16 @@ RestartSec=5s
 WatchdogSec=30s
 PIDFile=/run/tesla_fan_control.pid
 
+# Stop semantics (Power Limit, ADR-0009):
+# On SIGTERM the daemon restores fan PWM control to the BIOS-managed
+# pwm_enable snapshot and disarms the kernel watchdog. The configured
+# Power Limit (per-GPU `power_limit_w`) is **NOT** restored to the driver
+# default by default — that would create a PSU-exposure window during the
+# daemon-down phase, which is the exact failure this feature exists to
+# prevent. Set `[global] power_limit_restore_on_shutdown = true` to opt
+# into restore-on-stop for clean uninstall scenarios. Crash paths (panic,
+# SIGKILL) always preserve the limit regardless of that flag.
+
 # Disable per-service journal rate limiting — pre-reboot fault messages
 # are the single most important records this daemon emits and must
 # never be dropped. Volume is bounded (~10 evts/s worst case).

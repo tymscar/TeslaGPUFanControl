@@ -46,6 +46,9 @@ pub struct GlobalConfig {
     pub poll_interval_ms: u32,
     pub log_level: LogLevel,
     pub log_file: Option<PathBuf>,
+    pub power_limit_check_interval_s: u32,
+    pub power_limit_restore_on_shutdown: bool,
+    pub power_limit_validate_max_w: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +66,8 @@ pub struct GpuConfig {
     pub curve: Curve,
     pub min_fan_pct: Pct,
     pub max_fan_pct: Pct,
+    pub power_limit_enabled: bool,
+    pub power_limit_w: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,9 +197,19 @@ fn known_keys(kind: SectionKind) -> &'static [&'static str] {
             "poll_interval_ms",
             "log_level",
             "log_file",
+            "power_limit_check_interval_s",
+            "power_limit_restore_on_shutdown",
+            "power_limit_validate_max_w",
         ],
         SectionKind::Watchdog => &["enabled", "device", "timeout_s", "gpu_fail_threshold"],
-        SectionKind::Gpu => &["nvml_index", "curve", "min_fan_pct", "max_fan_pct"],
+        SectionKind::Gpu => &[
+            "nvml_index",
+            "curve",
+            "min_fan_pct",
+            "max_fan_pct",
+            "power_limit_enabled",
+            "power_limit_w",
+        ],
         SectionKind::Fan => &[
             "chip",
             "device_path",
@@ -346,11 +361,26 @@ pub fn parse(s: &str) -> Result<(Config, Vec<Warning>), ConfigError> {
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                     .map(PathBuf::from);
+                let power_limit_check_interval_s = match get("power_limit_check_interval_s") {
+                    Some(raw) => parse_u32(name, "power_limit_check_interval_s", raw)?,
+                    None => 120,
+                };
+                let power_limit_restore_on_shutdown = match get("power_limit_restore_on_shutdown") {
+                    Some(raw) => parse_bool(name, "power_limit_restore_on_shutdown", raw)?,
+                    None => false,
+                };
+                let power_limit_validate_max_w = match get("power_limit_validate_max_w") {
+                    Some(raw) => parse_u32(name, "power_limit_validate_max_w", raw)?,
+                    None => 1000,
+                };
                 global = Some(GlobalConfig {
                     config_version,
                     poll_interval_ms,
                     log_level,
                     log_file,
+                    power_limit_check_interval_s,
+                    power_limit_restore_on_shutdown,
+                    power_limit_validate_max_w,
                 });
             }
             SectionKind::Watchdog => {
@@ -374,12 +404,22 @@ pub fn parse(s: &str) -> Result<(Config, Vec<Warning>), ConfigError> {
                     .min(u32::from(u8::MAX)) as u8);
                 let max_fan_pct = Pct(parse_u32(name, "max_fan_pct", require("max_fan_pct")?)?
                     .min(u32::from(u8::MAX)) as u8);
+                let power_limit_enabled = match get("power_limit_enabled") {
+                    Some(raw) => parse_bool(name, "power_limit_enabled", raw)?,
+                    None => false,
+                };
+                let power_limit_w = match get("power_limit_w") {
+                    Some(raw) => Some(parse_u32(name, "power_limit_w", raw)?),
+                    None => None,
+                };
                 gpus.push(GpuConfig {
                     id,
                     nvml_index,
                     curve,
                     min_fan_pct,
                     max_fan_pct,
+                    power_limit_enabled,
+                    power_limit_w,
                 });
             }
             SectionKind::Fan => {
@@ -791,6 +831,51 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<ValidationError>> {
                 "unsupported config_version {} (this daemon recognises {})",
                 cfg.global.config_version, CONFIG_VERSION_SUPPORTED
             ),
+        ));
+    }
+
+    // ----- P — Per-GPU Power Limit (ADR-0008) -----
+    const POWER_LIMIT_W_FLOOR: u32 = 25;
+    let pl_max = cfg.global.power_limit_validate_max_w;
+    for gpu in &cfg.gpus {
+        if gpu.power_limit_enabled && gpu.power_limit_w.is_none() {
+            errs.push(rule(
+                "P1",
+                Some(format!("gpu:{}", gpu.id)),
+                Some("power_limit_w".into()),
+                "power_limit_enabled = true requires power_limit_w to be set",
+            ));
+        }
+        if let Some(w) = gpu.power_limit_w {
+            if w < POWER_LIMIT_W_FLOOR || w > pl_max {
+                errs.push(rule(
+                    "P2",
+                    Some(format!("gpu:{}", gpu.id)),
+                    Some("power_limit_w".into()),
+                    format!(
+                        "power_limit_w {w} outside [{POWER_LIMIT_W_FLOOR}, {pl_max}] (upper bound from [global] power_limit_validate_max_w)"
+                    ),
+                ));
+            }
+        }
+    }
+    if !(10..=3600).contains(&cfg.global.power_limit_check_interval_s) {
+        errs.push(rule(
+            "P4",
+            Some("global".into()),
+            Some("power_limit_check_interval_s".into()),
+            format!(
+                "power_limit_check_interval_s {} outside [10, 3600]",
+                cfg.global.power_limit_check_interval_s
+            ),
+        ));
+    }
+    if !(100..=10_000).contains(&pl_max) {
+        errs.push(rule(
+            "P5",
+            Some("global".into()),
+            Some("power_limit_validate_max_w".into()),
+            format!("power_limit_validate_max_w {pl_max} outside [100, 10000]"),
         ));
     }
 
@@ -1265,6 +1350,96 @@ fans = f1
         cfg.global.config_version = 99;
         let errs = validation_errors(&cfg);
         assert!(rules_in(&errs).contains(&"W7"));
+    }
+
+    // P1 — power_limit_enabled = true requires power_limit_w
+    #[test]
+    fn p1_enabled_without_value() {
+        let mut cfg = parse_ok(canonical());
+        cfg.gpus[0].power_limit_enabled = true;
+        cfg.gpus[0].power_limit_w = None;
+        let errs = validation_errors(&cfg);
+        assert!(rules_in(&errs).contains(&"P1"), "errs: {errs:?}");
+    }
+
+    // P2 — power_limit_w below the 25 W floor
+    #[test]
+    fn p2_power_limit_below_floor() {
+        let mut cfg = parse_ok(canonical());
+        cfg.gpus[0].power_limit_enabled = true;
+        cfg.gpus[0].power_limit_w = Some(10);
+        let errs = validation_errors(&cfg);
+        assert!(rules_in(&errs).contains(&"P2"), "errs: {errs:?}");
+    }
+
+    // P2 — power_limit_w above the operator-configurable upper bound
+    #[test]
+    fn p2_power_limit_above_validate_max() {
+        let mut cfg = parse_ok(canonical());
+        cfg.global.power_limit_validate_max_w = 1000;
+        cfg.gpus[0].power_limit_enabled = true;
+        cfg.gpus[0].power_limit_w = Some(25_000); // mW typo (forgot unit)
+        let errs = validation_errors(&cfg);
+        assert!(rules_in(&errs).contains(&"P2"), "errs: {errs:?}");
+    }
+
+    // P2 — at the configured upper bound is accepted (boundary)
+    #[test]
+    fn p2_power_limit_at_validate_max_is_ok() {
+        let mut cfg = parse_ok(canonical());
+        cfg.global.power_limit_validate_max_w = 1000;
+        cfg.gpus[0].power_limit_enabled = true;
+        cfg.gpus[0].power_limit_w = Some(1000);
+        let errs = validation_errors(&cfg);
+        assert!(!rules_in(&errs).contains(&"P2"), "errs: {errs:?}");
+    }
+
+    // P3 — disabled with a configured value: allowed (lets you preserve the
+    // value while temporarily disabling). Crucially: P1 must NOT fire here.
+    #[test]
+    fn p3_disabled_with_value_is_ok() {
+        let mut cfg = parse_ok(canonical());
+        cfg.gpus[0].power_limit_enabled = false;
+        cfg.gpus[0].power_limit_w = Some(250);
+        let errs = validation_errors(&cfg);
+        let codes = rules_in(&errs);
+        assert!(!codes.contains(&"P1"), "codes: {codes:?}");
+        // P2 still applies even when disabled — it's a typo guard, not gated.
+        assert!(!codes.contains(&"P2"), "codes: {codes:?}");
+    }
+
+    // P4 — power_limit_check_interval_s outside [10, 3600]
+    #[test]
+    fn p4_interval_too_short() {
+        let mut cfg = parse_ok(canonical());
+        cfg.global.power_limit_check_interval_s = 5;
+        let errs = validation_errors(&cfg);
+        assert!(rules_in(&errs).contains(&"P4"), "errs: {errs:?}");
+    }
+
+    #[test]
+    fn p4_interval_too_long() {
+        let mut cfg = parse_ok(canonical());
+        cfg.global.power_limit_check_interval_s = 3601;
+        let errs = validation_errors(&cfg);
+        assert!(rules_in(&errs).contains(&"P4"), "errs: {errs:?}");
+    }
+
+    // P5 — power_limit_validate_max_w outside [100, 10000]
+    #[test]
+    fn p5_validate_max_too_low() {
+        let mut cfg = parse_ok(canonical());
+        cfg.global.power_limit_validate_max_w = 50;
+        let errs = validation_errors(&cfg);
+        assert!(rules_in(&errs).contains(&"P5"), "errs: {errs:?}");
+    }
+
+    #[test]
+    fn p5_validate_max_too_high() {
+        let mut cfg = parse_ok(canonical());
+        cfg.global.power_limit_validate_max_w = 20_000;
+        let errs = validation_errors(&cfg);
+        assert!(rules_in(&errs).contains(&"P5"), "errs: {errs:?}");
     }
 
     // Multiple violations accumulate

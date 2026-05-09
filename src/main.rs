@@ -13,6 +13,7 @@ mod fan;
 mod group;
 mod logger;
 mod nvml;
+mod power;
 mod units;
 mod watchdog;
 
@@ -29,7 +30,7 @@ use std::time::{Duration, Instant};
 use crate::config::{Config, FanConfig, GpuConfig, GroupConfig};
 use crate::fan::{Fan, SPIN_UP_DELTA_PCT};
 use crate::group::{CoolingGroup, FanId, GpuId, GpuView};
-use crate::nvml::{NvmlReader, TempReader};
+use crate::nvml::{NvmlOps, NvmlReader};
 use crate::units::{Celsius, Pct};
 use crate::watchdog::{FanHealth, FaultTracker, HardwareWatchdog};
 
@@ -134,7 +135,13 @@ fn run_daemon(cfg_path: &Path, foreground: bool) -> Result<()> {
 
     // ADR-0003 step 3: NVML init (validates every requested index).
     let nvml_indices: Vec<u32> = cfg.gpus.iter().map(|g| g.nvml_index).collect();
-    let nvml = NvmlReader::init(&nvml_indices).context("NVML initialisation")?;
+    let mut nvml = NvmlReader::init(&nvml_indices).context("NVML initialisation")?;
+
+    // ADR-0008 R6: apply Power Limits to every GPU that opted in. Runs before
+    // the watchdog is armed so any failure leaves BIOS in control of the
+    // fans (ADR-0002 BIOS failsafe still holds — refuse-to-start is safe).
+    apply_power_limits_at_startup(&mut nvml, &cfg.gpus)
+        .context("R6: applying configured Power Limits")?;
 
     // ADR-0003 step 4: arm the hardware watchdog BEFORE taking PWM control.
     // If watchdog opens fail here, BIOS still owns the fans (safe fallback).
@@ -218,6 +225,7 @@ fn run_daemon(cfg_path: &Path, foreground: bool) -> Result<()> {
     let mut last_temps: HashMap<GpuId, Celsius> = HashMap::new();
     let mut last_set_pct: HashMap<FanId, Pct> = HashMap::new();
     let mut last_rpm: HashMap<FanId, u32> = HashMap::new();
+    let mut last_power_check: HashMap<GpuId, Instant> = HashMap::new();
 
     // ------------------------- main loop ------------------------------ //
     while !shutdown_flag.load(Ordering::Relaxed) {
@@ -253,10 +261,75 @@ fn run_daemon(cfg_path: &Path, foreground: bool) -> Result<()> {
             if let Some(fault) = fault_tracker.tick_gpu(&gpu.id, read_ok) {
                 tracing::error!(
                     ?fault,
-                    fault_kind = "thermal_blind",
+                    fault_kind = "gpu_nvml",
                     "declared fault — stopping watchdog feed"
                 );
                 should_slam = true;
+            }
+
+            // ADR-0008 main-loop step 1b — Power Limit drift check.
+            // Runs only when due (every Nth poll). Failures here use the
+            // independent power counter in FaultTracker (split-counter
+            // design — see ADR-0008 §FaultTracker).
+            if gpu.power_limit_enabled {
+                let target_w = match gpu.power_limit_w {
+                    Some(w) => w,
+                    None => continue, // P1 should have caught; defensive.
+                };
+                let interval =
+                    Duration::from_secs(u64::from(cfg.global.power_limit_check_interval_s));
+                if power::due(
+                    last_power_check.get(&gpu.id).copied(),
+                    Instant::now(),
+                    interval,
+                ) {
+                    let outcome = match nvml.read_power_limit_w(gpu.nvml_index) {
+                        Ok(measured) if measured == target_w => Ok(()),
+                        Ok(measured) if measured < target_w => {
+                            tracing::warn!(
+                                gpu_id = %gpu.id,
+                                measured_w = measured,
+                                target_w,
+                                direction = "down",
+                                "power-limit drift below target; re-asserting (no PSU risk)"
+                            );
+                            nvml.set_power_limit_w(gpu.nvml_index, target_w)
+                        }
+                        Ok(measured) => {
+                            // Upward drift = PSU exposure (ADR-0008).
+                            tracing::error!(
+                                gpu_id = %gpu.id,
+                                measured_w = measured,
+                                target_w,
+                                direction = "up",
+                                "power-limit drift ABOVE target; PSU exposure — re-asserting"
+                            );
+                            sd_notify(&format!(
+                                "STATUS=power-limit drift up on {} ({}W > {}W target) — re-asserted",
+                                gpu.id, measured, target_w
+                            ));
+                            nvml.set_power_limit_w(gpu.nvml_index, target_w)
+                        }
+                        Err(e) => Err(e),
+                    };
+                    let op_ok = outcome.is_ok();
+                    if let Err(e) = outcome {
+                        tracing::warn!(
+                            gpu_id = %gpu.id,
+                            error = %e,
+                            "power-limit operation failed"
+                        );
+                    }
+                    if let Some(fault) = fault_tracker.tick_gpu_power(&gpu.id, op_ok) {
+                        tracing::error!(
+                            ?fault,
+                            fault_kind = "gpu_nvml",
+                            "declared fault — stopping watchdog feed"
+                        );
+                        should_slam = true;
+                    }
+                    last_power_check.insert(gpu.id.clone(), Instant::now());
+                }
             }
         }
 
@@ -347,6 +420,16 @@ fn run_daemon(cfg_path: &Path, foreground: bool) -> Result<()> {
     // ----------------------- graceful shutdown ------------------------ //
     tracing::info!("shutdown signal received; restoring fans and disarming watchdog");
     sd_notify("STOPPING=1");
+
+    // ADR-0009: Power Limit restore is opt-in. Default keeps the limit at
+    // its last-set value so PSU protection persists across daemon-down
+    // windows. Runs FIRST (before fan restore) so it happens while NVML is
+    // healthy and we still own manual fan control. Failures here log WARN
+    // and don't block the rest of shutdown.
+    if cfg.global.power_limit_restore_on_shutdown {
+        restore_power_limits_to_default(&mut nvml, &cfg.gpus);
+    }
+
     // ADR-0003 inverse order: release PWM control BEFORE disarming the
     // watchdog. Continue restoring even if one fan fails.
     for (fan_id, fan) in fans.iter_mut() {
@@ -382,6 +465,82 @@ fn build_cooling_groups(groups: &[GroupConfig]) -> Vec<CoolingGroup> {
             fans: g.fans.clone(),
         })
         .collect()
+}
+
+/// ADR-0009 — opt-in shutdown helper. Restores each enabled GPU's
+/// management limit to the driver default. Failures log WARN and do not
+/// abort the rest of the graceful-shutdown sequence; we are already in the
+/// pre-disarm phase and the watchdog still has to be released.
+fn restore_power_limits_to_default(nvml: &mut NvmlReader, gpus: &[GpuConfig]) {
+    for gpu in gpus {
+        if !gpu.power_limit_enabled {
+            continue;
+        }
+        let default_w = match nvml.read_power_limit_default_w(gpu.nvml_index) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(
+                    gpu_id = %gpu.id,
+                    error = %e,
+                    "shutdown: could not read default Power Limit; leaving current value in place"
+                );
+                continue;
+            }
+        };
+        match nvml.set_power_limit_w(gpu.nvml_index, default_w) {
+            Ok(()) => tracing::info!(
+                gpu_id = %gpu.id,
+                default_w,
+                "shutdown: restored Power Limit to driver default"
+            ),
+            Err(e) => tracing::warn!(
+                gpu_id = %gpu.id,
+                error = %e,
+                "shutdown: failed to restore Power Limit"
+            ),
+        }
+    }
+}
+
+/// R6 — refuse to start if any configured `power_limit_w` is outside the
+/// driver's `power_management_limit_constraints` or if the initial
+/// `set_power_management_limit` call fails. ADR-0001 fail-loud policy:
+/// if the operator asked for a Power Limit and we can't honour it, do not
+/// pretend.
+fn apply_power_limits_at_startup(nvml: &mut NvmlReader, gpus: &[GpuConfig]) -> Result<()> {
+    for gpu in gpus {
+        if !gpu.power_limit_enabled {
+            continue;
+        }
+        let target_w = gpu.power_limit_w.ok_or_else(|| {
+            anyhow!(
+                "internal: P1 should have caught missing power_limit_w for {}",
+                gpu.id
+            )
+        })?;
+        let (min_w, max_w) = nvml
+            .power_limit_constraints_w(gpu.nvml_index)
+            .with_context(|| format!("R6: reading power-limit constraints for gpu:{}", gpu.id))?;
+        if target_w < min_w || target_w > max_w {
+            return Err(anyhow!(
+                "R6: gpu:{} power_limit_w {} W outside driver constraints [{}, {}] W",
+                gpu.id,
+                target_w,
+                min_w,
+                max_w
+            ));
+        }
+        nvml.set_power_limit_w(gpu.nvml_index, target_w)
+            .with_context(|| format!("R6: applying initial Power Limit to gpu:{}", gpu.id))?;
+        tracing::info!(
+            gpu_id = %gpu.id,
+            power_limit_w = target_w,
+            min_w,
+            max_w,
+            "applied configured Power Limit"
+        );
+    }
+    Ok(())
 }
 
 fn verify_fan_sysfs(path: &Path, fan_cfg: &FanConfig) -> Result<()> {
@@ -494,6 +653,9 @@ fn structurally_identical(a: &Config, b: &Config) -> Result<(), String> {
 fn swap_data_fields(running: &mut Config, new: Config) {
     running.global.log_level = new.global.log_level;
     running.global.poll_interval_ms = new.global.poll_interval_ms;
+    running.global.power_limit_check_interval_s = new.global.power_limit_check_interval_s;
+    running.global.power_limit_restore_on_shutdown = new.global.power_limit_restore_on_shutdown;
+    running.global.power_limit_validate_max_w = new.global.power_limit_validate_max_w;
     running.watchdog.gpu_fail_threshold = new.watchdog.gpu_fail_threshold;
 
     let new_gpus: HashMap<String, GpuConfig> =
@@ -503,6 +665,8 @@ fn swap_data_fields(running: &mut Config, new: Config) {
             gpu.curve = updated.curve.clone();
             gpu.min_fan_pct = updated.min_fan_pct;
             gpu.max_fan_pct = updated.max_fan_pct;
+            gpu.power_limit_enabled = updated.power_limit_enabled;
+            gpu.power_limit_w = updated.power_limit_w;
         }
     }
     let new_fans: HashMap<String, FanConfig> =

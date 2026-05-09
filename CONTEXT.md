@@ -26,8 +26,13 @@ _Avoid_: just "watchdog" — always qualify as "hardware watchdog", "internal fa
 **Internal Failure Logic**:
 Per-GPU and per-fan consecutive-failure counters maintained inside the daemon. When a counter exceeds its threshold, the daemon declares a fault, maxes all fans, and stops feeding the **Hardware Watchdog**. Distinct from the **Hardware Watchdog** itself, which is a kernel mechanism.
 
-**Thermal-Blind Fault**:
-The fault state declared when a GPU's NVML temperature read fails for `gpu_fail_threshold` consecutive polls. Treated as severe as a fan hardware fault: max all fans, stop feeding the **Hardware Watchdog**, kernel reboots.
+**GPU NVML Fault** (formerly **Thermal-Blind Fault**):
+The fault state declared when any per-**GPU** NVML operation — temperature read, **Power Limit** read, or **Power Limit** set — fails for `gpu_fail_threshold` consecutive ticks. Treated as severe as a fan hardware fault: max all fans, stop feeding the **Hardware Watchdog**, kernel reboots. The shared counter and shared response reflect ADR-0001: we don't act differently per failing API, so they share one fault category.
+_Avoid_: "thermal-blind" alone (the term is retained as a historical alias because temperature-read failure was the original trigger, but the category is broader now).
+
+**Power Limit**:
+A configured maximum power draw (watts) for a **GPU**, applied via NVML's power-management-limit interface at startup and re-asserted on a global cadence so external changes (e.g. `nvidia-smi -pl …`, driver reloads, other tools) are reverted. A property of a **GPU**, opt-in per **GPU**. **Protective, not convenient**: the typical use case is a system whose PSU cannot sustain all GPUs at full board power simultaneously, so the **Power Limit** is a hard ceiling that prevents brown-out. An external override that *raises* the limit is therefore a safety event, not a routine drift.
+_Avoid_: TDP (different — board design power), power-cap (overloaded; ADR-0001 uses the phrase when rejecting a softer fault-response policy, not this feature), throttle (a thermal-driven mechanism inside the GPU).
 
 ## Relationships
 
@@ -44,7 +49,7 @@ The fault state declared when a GPU's NVML temperature read fails for `gpu_fail_
 > **Domain expert:** "It runs at the curve output for 80 °C. The group's target is `max(curve(80), curve(35))` so the hot GPU wins."
 >
 > **Dev:** "And if GPU 0's NVML read fails?"
-> **Domain expert:** "After `gpu_fail_threshold` polls we declare a **Thermal-Blind Fault**, max every **Fan** in every **Cooling Group**, and stop feeding the **Hardware Watchdog**. The kernel reboots after `timeout_s`."
+> **Domain expert:** "After `gpu_fail_threshold` polls we declare a **GPU NVML Fault**, max every **Fan** in every **Cooling Group**, and stop feeding the **Hardware Watchdog**. The kernel reboots after `timeout_s`. Same counter and same response if instead the **Power Limit** read or set is failing — we don't distinguish, since the fault response is identical."
 
 ## Flagged ambiguities
 

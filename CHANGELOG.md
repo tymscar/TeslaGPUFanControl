@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Per-GPU **Power Limit** enforcement via NVML. Opt-in per GPU
+  (`power_limit_enabled`, `power_limit_w`); set at startup and re-asserted
+  on a global cadence (`[global] power_limit_check_interval_s`, default
+  120 s) so external changes (`nvidia-smi -pl`, driver reloads, other
+  tools) are reverted. Designed for PSU-constrained boxes where the
+  power supply cannot sustain all GPUs at full board power. See
+  ADR-0008 and `docs/CONFIG-TUTORIAL.md` §"Limiting GPU power".
+- Asymmetric drift handling: downward drift logs WARN and re-asserts;
+  upward drift (PSU exposure) logs ERROR, emits `sd_notify(STATUS=…)`,
+  and re-asserts.
+- New `[global] power_limit_restore_on_shutdown` (default `false`) —
+  controls whether graceful shutdown restores each GPU's limit to the
+  NVML driver default. Default preserves PSU protection across
+  daemon-down windows. See ADR-0009.
+- New `[global] power_limit_validate_max_w` (default `1000`) — operator-
+  configurable typo-defence upper bound for `power_limit_w`. Hardware
+  whose peak exceeds 1 kW can bump this without a code change.
+- New static validation rules **P1–P5** (per-GPU power), runnable via
+  `--check-config`. New runtime check **R6** validates the configured
+  value against the driver's `power_management_limit_constraints` and
+  the initial `set_power_management_limit` call at startup; the daemon
+  refuses to start on failure.
+
+### Changed
+
+- **Fault category renamed: `Fault::ThermalBlind` → `Fault::GpuNvml`.**
+  The fault now covers any per-GPU NVML operation failure (temperature
+  read, power-limit read, power-limit set), not just temperature reads.
+  Log field `fault_kind = "thermal_blind"` becomes `"gpu_nvml"`.
+  **Operator action:** update any log-monitoring rules / dashboards
+  that filter on the old string. The threshold knob name
+  (`gpu_fail_threshold`) is unchanged.
+- `FaultTracker` now keeps two independent counters per GPU (temperature
+  and power) sharing the same `gpu_fail_threshold` and declaring the
+  same `Fault::GpuNvml`. Existing temperature-only behaviour is
+  byte-identical; the split exists to prevent a dilution bug where
+  successful temperature ticks would reset a counter the rarer power
+  tick had just incremented.
+- `nvml.rs` trait `TempReader` renamed to `NvmlOps` and extended with
+  `read_power_limit_w`, `power_limit_constraints_w`, `set_power_limit_w`
+  (`&mut self`). `FakeNvml` extended in lockstep.
+
 ## [0.1.0] - 2026-05-03
 
 ### Added

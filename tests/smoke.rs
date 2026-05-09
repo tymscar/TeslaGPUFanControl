@@ -85,6 +85,30 @@ fn w7_unknown_config_version_fixture_surfaces_rule_code() {
 }
 
 #[test]
+fn p1_enabled_without_value_surfaces_rule_code() {
+    let out = run_check_config("tests/fixtures/p1_enabled_without_value.conf");
+    assert_rule_in_stderr(&out, "[P1]");
+}
+
+#[test]
+fn p2_power_above_validate_max_surfaces_rule_code() {
+    let out = run_check_config("tests/fixtures/p2_power_above_validate_max.conf");
+    assert_rule_in_stderr(&out, "[P2]");
+}
+
+#[test]
+fn p4_interval_out_of_range_surfaces_rule_code() {
+    let out = run_check_config("tests/fixtures/p4_interval_out_of_range.conf");
+    assert_rule_in_stderr(&out, "[P4]");
+}
+
+#[test]
+fn p5_validate_max_out_of_range_surfaces_rule_code() {
+    let out = run_check_config("tests/fixtures/p5_validate_max_out_of_range.conf");
+    assert_rule_in_stderr(&out, "[P5]");
+}
+
+#[test]
 fn missing_config_file_exits_nonzero() {
     let out = Command::new(BIN)
         .args([

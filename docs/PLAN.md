@@ -65,6 +65,17 @@ poll_interval_ms = 1000        # How often to read temp and update fans
 log_level        = info        # debug | info | warn | error
 log_file         = /var/log/tesla_fan_control.log   # empty = journald only
 
+# Power Limit (PSU protection, see ADR-0008). Only enabled if at least one
+# [gpu:N] block sets power_limit_enabled = true.
+power_limit_check_interval_s    = 120     # re-assert cadence in seconds (10..=3600)
+power_limit_restore_on_shutdown = false   # see ADR-0009 — default keeps the
+                                          # limit applied across daemon-down
+                                          # windows so PSU protection persists.
+power_limit_validate_max_w      = 1000    # typo guard: --check-config rejects
+                                          # power_limit_w > this value. Bump only
+                                          # if you have hardware that legitimately
+                                          # exceeds 1 kW.
+
 [watchdog]
 enabled             = true
 
@@ -96,9 +107,13 @@ device              = /dev/watchdog
 # The kernel may round this to its nearest supported value.
 timeout_s           = 30
 
-# How many consecutive NVML temperature-read failures before declaring a
-# thermal-blind fault: all fans → 100%, watchdog stops being fed, kernel
-# reboots after timeout_s. Symmetric with fan_fail_threshold below.
+# How many consecutive per-GPU NVML failures before declaring a
+# `Fault::GpuNvml` fault: all fans → 100%, watchdog stops being fed,
+# kernel reboots after timeout_s. Symmetric with fan_fail_threshold below.
+# Counts apply to temperature reads AND power-limit reads/sets — each
+# operation has its own per-GPU counter sharing this single threshold and
+# this single fault. Was historically called "thermal-blind"; renamed in
+# ADR-0008 once the power-limit feature broadened the category.
 gpu_fail_threshold  = 3
 
 # --- GPUs ---
@@ -107,6 +122,14 @@ gpu_fail_threshold  = 3
 
 [gpu:0]
 nvml_index   = 0              # NVML device index
+
+# Power Limit (optional, opt-in per GPU; ADR-0008). Set both keys to enable.
+# When true, the daemon enforces power_limit_w (in watts) at startup and
+# re-asserts it every [global] power_limit_check_interval_s seconds.
+# Driver constraints (power.min_limit / power.max_limit) are checked at
+# runtime check R6 — daemon refuses to start if power_limit_w is outside.
+power_limit_enabled = false   # default false; existing configs unchanged
+# power_limit_w     = 250     # required when enabled; 25..=power_limit_validate_max_w
 
 # Fan curve: comma-separated list of TEMP:SPEED pairs
 #   TEMP  = GPU temperature in degrees Celsius (integer)
@@ -256,6 +279,18 @@ Both phases **accumulate every violation before exiting**. Validation is a singl
 | W6 | `log_level ∈ {debug, info, warn, error}` | Enum |
 | W7 | `[global].config_version` is set and the daemon recognises the value (currently only `1`) | Schema mismatch fails fast rather than producing baffling errors deep in parsing |
 
+### P — Per-GPU Power Limit (ADR-0008)
+
+Static rules; no hardware. Driver-side feasibility is R6.
+
+| # | Rule | Rationale |
+|---|---|---|
+| P1 | If `power_limit_enabled = true`, `power_limit_w` must be present | Enabling without a value is meaningless |
+| P2 | `power_limit_w ∈ [25, power_limit_validate_max_w]` when set | Below 25 W is below any plausible Tesla idle floor; upper bound is operator-configurable so future hardware doesn't need a code change |
+| P3 | If `power_limit_enabled = false`, `power_limit_w` is allowed but ignored | Lets you keep the value while temporarily disabling |
+| P4 | `power_limit_check_interval_s ∈ [10, 3600]` | Below 10 s hammers NVML; above 1 h is silly |
+| P5 | `power_limit_validate_max_w ∈ [100, 10000]` | Sanity bound for the sanity bound |
+
 ### T — Spell/typo detection
 
 | # | Rule | Action |
@@ -272,6 +307,7 @@ Both phases **accumulate every violation before exiting**. Validation is a singl
 | R3 | NVML init succeeds; every configured `nvml_index` is present | Refuse to start; log the out-of-range index and the actual device count |
 | R4 | `/dev/watchdog` opens without `EBUSY` | Refuse to start; suggest checking `RuntimeWatchdogSec=` and `lsof /dev/watchdog` |
 | R5 | `pwm_enable` for each fan is writable | Refuse to start; usually means not running as root |
+| R6 | For each GPU with `power_limit_enabled = true`: `power_limit_w` falls inside `power_management_limit_constraints`, AND the initial `set_power_management_limit` call succeeds | Refuse to start; log the offending GPU, the requested watts, and the driver's accepted `(min_w, max_w)` range. Runs after R3 and **before** the watchdog is armed (ADR-0003), so a failure leaves BIOS in control. |
 
 ---
 
@@ -290,8 +326,14 @@ Both phases **accumulate every violation before exiting**. Validation is a singl
 
 ### `nvml.rs`
 - Wraps `nvml_wrapper::Nvml`. Holds the singleton `Nvml` handle and a `Vec<Device<'_>>` keyed by `nvml_index`.
-- `read_temp(idx) -> Result<Celsius, NvmlError>` — calls `device.temperature(TemperatureSensor::Gpu)` and **applies a sanity-bounds check**: any value outside `[5, 110] °C` is treated as if NVML had errored (returns `Err(NvmlError::OutOfBounds)`). This guards against driver bugs or sensor misreads that return `0` (which would silently idle the fan while the GPU overheats) or absurdly high values (which would peg the fan but indicate the temp itself is unreliable). The out-of-bounds error counts toward `gpu_fail_threshold` like any other read failure.
+- Public surface is the **`NvmlOps` trait** (renamed from `TempReader` in ADR-0008 once the power-limit feature widened the surface). Methods:
+  - `read_temp(idx) -> Result<Celsius, NvmlError>` — see sanity-bounds note below.
+  - `read_power_limit_w(idx) -> Result<u32, NvmlError>` — calls `device.power_management_limit()` (mW) and divides by 1000. **Not** `enforced_power_limit()` — that returns the value the firmware is currently enforcing, which can drop below the management limit when hardware thermal protection kicks in; reading it would make the daemon fight hardware self-protection.
+  - `power_limit_constraints_w(idx) -> Result<(u32, u32), NvmlError>` — calls `device.power_management_limit_constraints()` (mW), returns `(min_w, max_w)`. Used by R6 to decide whether the configured `power_limit_w` is feasible.
+  - `set_power_limit_w(&mut self, idx, watts) -> Result<(), NvmlError>` — calls `device.set_power_management_limit(watts * 1000)`. Requires `&mut self` (NVML's API requires `&mut Device`, which propagates). The composition root holds `let mut nvml = NvmlReader::init(...)`.
+- The temperature sanity-bounds check is unchanged: values outside `[5, 110] °C` return `Err(NvmlError::OutOfBounds)`. This guards against driver bugs or sensor misreads that return `0` (which would silently idle the fan while the GPU overheats) or absurdly high values (which would peg the fan but indicate the temp itself is unreliable). The out-of-bounds error counts toward `gpu_fail_threshold` like any other read failure.
 - Init failure is fatal at startup per ADR-0003 step 3. The realistic failure modes are: `libnvidia-ml.so.1` not present (driver not installed), driver present but its kernel module not loaded, or the configured `nvml_index` exceeds the device count. `nvidia-persistenced` not running is *not* a failure mode — its absence only adds latency to the next `nvmlInit` after idle, which we avoid by keeping NVML open continuously.
+- The `FakeNvml` test double implements `NvmlOps` and tracks per-index `power_limit_w` and `(min_w, max_w)` constraints. Tests use it to simulate external drift (mutate the map between reads) and to assert R6 / drift / fault behaviour without hardware.
 
 ### `chip.rs`
 - At startup: scan `/sys/class/hwmon/*/name`, build a map `chip_name -> hwmonN_path`.
@@ -342,11 +384,11 @@ Uninstall recommendation: after `uninstall.sh` removes the service, reboot the b
 
 **Internal failure logic (`FaultTracker`):**
 
-GPU temperature failures:
-- Per-GPU consecutive NVML failure counter.
-- `tick_gpu(gpu_id, read_ok)`:
-  - Increment / reset counter.
-  - If counter > `gpu_fail_threshold`: declare `Fault::ThermalBlind { gpu_id }`. The caller (main loop) sees the fault, calls `Fan::set_max()` on every fan across every group, and stops feeding the hardware watchdog.
+GPU NVML failures (covers temperature reads + power-limit reads/sets — ADR-0008):
+- **Two independent per-GPU counters** sharing one threshold and one fault. The split exists because temp ticks every poll while power ticks only every `power_limit_check_interval_s`; without separate counters, successful temp ticks would reset a counter that the rarer power tick had just incremented, and a permanently-broken power path would never declare a fault.
+- `tick_gpu(gpu_id, read_ok)` — temperature path. Increment / reset the temp counter. If it crosses `gpu_fail_threshold`, declare `Fault::GpuNvml { gpu_id }`.
+- `tick_gpu_power(gpu_id, op_ok)` — power-limit path. Same shape, separate counter, same threshold, same fault.
+- The caller (main loop) sees the fault, calls `Fan::set_max()` on every fan across every group, and stops feeding the hardware watchdog.
 
 Fan RPM hardware failures:
 - Per-fan consecutive out-of-range RPM counter.
@@ -374,7 +416,7 @@ Fan RPM hardware failures:
 | `debug` | Per-poll temp / PWM / RPM readings. Opt-in for troubleshooting only — at 1 Hz polling on a 3-GPU box this is ~30 evts/s. |
 | `info` | State transitions: daemon ready, config reloaded, SpinUp → Ok, SIGUSR1 dumps, calibration progress. Default level. |
 | `warn` | Recoverable anomalies: per-poll fault-counter increments (RPM out of range), spin-up grace expired without RPM crossing `min_rpm`, NVML transient errors. |
-| `error` | **Declared faults**: `ThermalBlind`, `FanHardware`. Startup validation failures. The "stopping watchdog feed" pre-reboot message. |
+| `error` | **Declared faults**: `GpuNvml`, `FanHardware`. Startup validation failures. The "stopping watchdog feed" pre-reboot message. **Upward power-limit drift** (`direction = "up"`) — PSU exposure event per ADR-0008. |
 
 Standard structured fields (set as `tracing` fields, not interpolated into the message text — searchable via `journalctl _SYSTEMD_UNIT=tesla_fan_control.service FAN_ID=f0`):
 
@@ -387,7 +429,8 @@ Standard structured fields (set as `tracing` fields, not interpolated into the m
 | `pct` | curve / target / set events | `u8` |
 | `rpm` | RPM reads | `u32` |
 | `pwm` | sysfs writes | `u8` |
-| `fault_kind` | declared faults | `"thermal_blind"` \| `"fan_hardware"` |
+| `fault_kind` | declared faults | `"gpu_nvml"` \| `"fan_hardware"` (was `"thermal_blind"` before ADR-0008) |
+| `direction` | power-limit drift events | `"up"` \| `"down"` |
 
 Style:
 
@@ -416,17 +459,25 @@ The volume risk is bounded — even under maximum pessimism (every poll declares
 ### `main.rs`
 - Single-threaded, blocking. No async, no threads. See ADR-0007.
 - CLI via `clap`: `-c <config>`, `-f` (foreground), `--version`, `--check-config` (validate and exit), `--calibrate-fans` (interactive sweep — see Calibration below).
-- Init order (ADR-0003): config → chip resolution → NVML → hardware watchdog → take manual PWM control → `sd_notify(READY=1)`.
+- Init order (ADR-0003): config → chip resolution → NVML → **R6 (apply Power Limits if enabled)** → hardware watchdog → take manual PWM control → `sd_notify(READY=1)`. R6 runs before the watchdog is armed so a power-limit failure leaves BIOS in control of fans (ADR-0002 BIOS failsafe still holds).
 - Signal handlers via `signal-hook`: SIGTERM/SIGINT → graceful shutdown; SIGHUP → config reload; SIGUSR1 → dump state.
 - Graceful shutdown order: stop main loop → `Fan::restore()` for every fan (writes back the `pwm_enable` snapshot taken at startup) → `HardwareWatchdog::disarm_and_close()` → exit 0.
 - **Main loop:**
   1. For each GPU: `nvml::read_temp(gpu)` → `fault_tracker.tick_gpu()`; cache temp.
+  1b. **Power Limit check (only when due, ADR-0008).** For each GPU with `power_limit_enabled = true`, if `power.due(last_check, now, interval)` is true:
+      - `nvml::read_power_limit_w(gpu)` — on Ok+match, no action.
+      - On Ok+`measured < target`: WARN log + re-assert (no PSU risk).
+      - On Ok+`measured > target`: ERROR log + `sd_notify(STATUS=…)` + re-assert (PSU exposure).
+      - Any NVML error or failed re-assert → `fault_tracker.tick_gpu_power(gpu_id, false)`. Crossing threshold declares `Fault::GpuNvml`, same response as the temp path.
   2. For each cooling group:
      a. `target_pct = group.target_pct(&temps, &gpus)`.
      b. For each fan in the group: `fan.set(target_pct)`, then `fan.read_rpm()` → `fan.check_health()` → `fault_tracker.tick_fan()`.
   3. If `!fault_tracker.any_fault()`: `hw_watchdog.feed()` + `sd_notify("WATCHDOG=1")`.
      If any fault: do not feed; the kernel countdown is now active.
   4. Sleep `poll_interval_ms` via `std::thread::sleep`.
+
+- **Pure helper `power.rs`** (~30 LOC, fully unit-testable):
+  - `due(last: Option<Instant>, now: Instant, interval: Duration) -> bool` — first call is always due; subsequent calls due once `now >= last + interval`.
 
 ---
 
@@ -449,10 +500,17 @@ Conversion: `pwm_value = (pct * 255) / 100`
 │                      Every poll loop                          │
 │                                                               │
 │  ┌─ GPU ─────────────────────────────────────────────────┐   │
-│  │  NVML read OK?  ──no──→ increment GPU failure counter  │   │
-│  │       │                 counter > gpu_fail_threshold?  │   │
-│  │      yes                └──yes──→ ALL fans → 100%      │   │
-│  │                                   declare THERMAL_BLIND │   │
+│  │  NVML temp read OK?    ──no──→ inc temp counter        │   │
+│  │  (every poll)                  counter > threshold?    │   │
+│  │       │                        └──yes──→ ALL fans 100% │   │
+│  │       │                                  Fault::GpuNvml│   │
+│  │       │                                                 │   │
+│  │  Power-limit op OK?    ──no──→ inc power counter       │   │
+│  │  (every Nth poll, when           (independent counter, │   │
+│  │   due — ADR-0008)                 same threshold)      │   │
+│  │       │                        counter > threshold?    │   │
+│  │      yes                       └──yes──→ ALL fans 100% │   │
+│  │                                          Fault::GpuNvml│   │
 │  └───────┼────────────────────────────────────────────────┘   │
 │          │                                                     │
 │  ┌─ Fan (per fan) ────────────────────────────────────────┐   │
@@ -596,9 +654,12 @@ The daemon deliberately limits what SIGHUP can change. This falls out of ADR-000
 
 **Hot-reloadable** (data-only swap, applied next poll iteration):
 - Per-GPU curve points, `min_fan_pct`, `max_fan_pct`.
+- Per-GPU `power_limit_enabled`, `power_limit_w` (next periodic check picks them up; the daemon does *not* eagerly write a new limit on SIGHUP — that's the same code path as drift handling).
 - `gpu_fail_threshold`, `fan_fail_threshold`.
 - Per-fan `min_rpm`, `max_rpm`.
-- `log_level`, `poll_interval_ms`.
+- `log_level`, `poll_interval_ms`, `power_limit_check_interval_s`, `power_limit_restore_on_shutdown`, `power_limit_validate_max_w`.
+
+**SIGHUP that flips `power_limit_enabled` from true → false** stops the periodic re-assert but leaves the limit at its last-set value (ADR-0009 — keeps PSU protection during diagnosis windows). Operators who want the firmware default back during a temporary disable run `nvidia-smi -pl <default>` themselves.
 
 **Not hot-reloadable** (require `systemctl restart`):
 - `chip`, `device_path`, `hwmon_path`, `pwm_channel` (would need to close and re-open sysfs PWM fds).
@@ -616,17 +677,19 @@ Symmetric init / shutdown order (see ADR-0003 for the underlying invariant):
 1. Parse + validate config.
 2. Resolve chips → hwmon paths.
 3. Initialize NVML, verify configured GPUs are present.
-4. **Open `/dev/watchdog`, arm with `WDIOC_SETTIMEOUT`.**
-5. **For each fan: `pwm_enable = 1` (take manual control).**
-6. `sd_notify(READY=1)`, enter main loop.
+4. **Apply Power Limits (R6, ADR-0008).** For each GPU with `power_limit_enabled = true`: validate `power_limit_w` against `power_management_limit_constraints`, then `set_power_management_limit(watts*1000)`. Refuse to start on any failure — BIOS still owns the fans, so the box is safe.
+5. **Open `/dev/watchdog`, arm with `WDIOC_SETTIMEOUT`.**
+6. **For each fan: `pwm_enable = 1` (take manual control).**
+7. `sd_notify(READY=1)`, enter main loop.
 
 **Shutdown (SIGTERM/SIGINT):**
 1. Stop main loop.
-2. **For each fan: write the snapshotted `pwm_enable` value back (see Fan Restore Policy).**
-3. **Write `'V'` to `/dev/watchdog` and close the fd (disarm).**
-4. `nvmlShutdown()`, exit 0.
+2. **If `power_limit_restore_on_shutdown = true`: for each GPU with `power_limit_enabled = true`, set the limit back to `power_management_limit_default()` (ADR-0009).** Default is `false` — limit persists across daemon-down windows so PSU protection isn't lost. Failures here log WARN and continue; the watchdog still has to be disarmed.
+3. **For each fan: write the snapshotted `pwm_enable` value back (see Fan Restore Policy).**
+4. **Write `'V'` to `/dev/watchdog` and close the fd (disarm).**
+5. `nvmlShutdown()`, exit 0.
 
-The two starred steps in startup are reversed in shutdown — the watchdog stays open through every transition that involves manual PWM control, and PWM control is released *before* the watchdog is disarmed.
+The starred steps in startup are reversed in shutdown — the watchdog stays open through every transition that involves manual PWM control, and PWM control is released *before* the watchdog is disarmed. Power-limit restore (when enabled) runs first so it happens while NVML is healthy and we still own manual fan control.
 
 **SIGKILL / crash:** the daemon never gets to run shutdown. The kernel closes the `/dev/watchdog` fd as part of process teardown; with `nowayout=0` (documented prerequisite) this auto-disarms the timer. PWM registers retain their last-written value until either (a) a new daemon instance takes over via `Restart=always`, or (b) the watchdog `timeout_s` expires and the kernel reboots — at which point BIOS 100% (ADR-0002) takes effect.
 
@@ -701,12 +764,12 @@ TDD (red-green-refactor) is mandated where the test surface is high-leverage and
 
 | Module | Workflow | Why |
 |---|---|---|
-| `units.rs`, `curve.rs`, `group.rs` | **Strict TDD** — red-green-refactor each function | Pure, deterministic; the test *is* the spec. Fastest feedback loop in the project. |
-| `watchdog::FaultTracker` | **Strict TDD** | Most safety-critical pure code; branch coverage is the goal and TDD makes that natural. |
-| `config::validation` | **Strict TDD, one test per rule** | The S/G/F/W/T validation table maps one-to-one onto `#[test]` functions. Each rule's failing test comes first, then the validator code grows to make it pass. |
+| `units.rs`, `curve.rs`, `group.rs`, `power.rs` | **Strict TDD** — red-green-refactor each function | Pure, deterministic; the test *is* the spec. Fastest feedback loop in the project. |
+| `watchdog::FaultTracker` | **Strict TDD** | Most safety-critical pure code; branch coverage is the goal and TDD makes that natural. The `tick_gpu_power` extension and dual-counter independence test (ADR-0008) follow this row — write the dilution-bug regression test first. |
+| `config::validation` | **Strict TDD, one test per rule** | The S/G/F/W/T/P validation table maps one-to-one onto `#[test]` functions. Each rule's failing test comes first, then the validator code grows to make it pass. |
 | `fan.rs`, `chip.rs` | **Spike then test** — write the API and one happy-path tempfile test, then iterate | TDD against sysfs tends to produce contrived test trees before the real I/O shape is known. |
-| `nvml.rs`, `watchdog::HardwareWatchdog` | **Test after** | Thin shims; integration tests against `FakeNvml` and `softdog` are what matter, and those don't fit a red-green loop well. |
-| `main.rs` | **No TDD** — smoke tests written last | Composition root; TDD doesn't apply meaningfully. |
+| `nvml.rs`, `watchdog::HardwareWatchdog` | **Test after** | Thin shims; integration tests against `FakeNvml` and `softdog` are what matter, and those don't fit a red-green loop well. The `NvmlOps` power-limit methods (ADR-0008) follow this row. |
+| `main.rs` | **No TDD** — smoke tests written last | Composition root; TDD doesn't apply meaningfully. R6 startup check, main-loop power tick, and lifecycle (ADR-0009) follow this row. |
 
 The strict-TDD modules cover every interesting logical decision in the system. By the end of Phase 3 (Logic), the validation rule set, fan curve, group target computation, and fault tracker should each have ≥ 1 test per code path before any of them have implementations.
 
@@ -727,10 +790,12 @@ fn curve_interpolates_linearly_between_points() {
 
 The `FaultTracker` is the most safety-critical pure module — every fault path must have a test:
 
-- NVML failure for `gpu_fail_threshold` consecutive polls → declares `ThermalBlind`.
+- Temp-read NVML failure for `gpu_fail_threshold` consecutive polls → declares `Fault::GpuNvml`.
+- Power-limit NVML failure for `gpu_fail_threshold` consecutive ticks → declares `Fault::GpuNvml` (independent counter; ADR-0008 §FaultTracker split).
+- Alternating temp success + power failure crosses threshold on the power side despite temp resets (the dilution-bug regression test).
 - RPM stalled past `fan_fail_threshold` → declares `FanHardware`.
 - `SpinUp` health does *not* increment the counter.
-- A single `Ok` reading mid-fault resets the counter.
+- A single `Ok` reading mid-fault resets the relevant counter (and only that counter — temp success does not reset the power counter).
 - `any_fault()` returns true exactly when a fault is declared.
 
 Aim for branch coverage on `FaultTracker`. The rest of the pure modules can target line coverage.

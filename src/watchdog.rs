@@ -23,9 +23,12 @@ pub enum FanFaultKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
-    ThermalBlind {
-        gpu_id: String,
-    },
+    /// Per-GPU NVML failure (temperature read OR power-limit read/set).
+    /// Renamed from `ThermalBlind` in ADR-0008 once the power-limit feature
+    /// broadened the category. Counter is split per-operation
+    /// (see `tick_gpu` / `tick_gpu_power`) but the threshold and the fault
+    /// are shared.
+    GpuNvml { gpu_id: String },
     FanHardware {
         fan_id: String,
         last_rpm: u32,
@@ -35,6 +38,7 @@ pub enum Fault {
 
 pub struct FaultTracker {
     gpu_counters: HashMap<String, u32>,
+    gpu_power_counters: HashMap<String, u32>,
     fan_counters: HashMap<String, u32>,
     gpu_threshold: u32,
     fan_threshold: u32,
@@ -48,10 +52,13 @@ impl FaultTracker {
         gpu_threshold: u32,
         fan_threshold: u32,
     ) -> Self {
-        let gpu_counters = gpu_ids.iter().map(|id| (id.clone(), 0u32)).collect();
+        let gpu_counters: HashMap<String, u32> =
+            gpu_ids.iter().map(|id| (id.clone(), 0u32)).collect();
+        let gpu_power_counters = gpu_counters.keys().map(|id| (id.clone(), 0u32)).collect();
         let fan_counters = fan_ids.iter().map(|id| (id.clone(), 0u32)).collect();
         Self {
             gpu_counters,
+            gpu_power_counters,
             fan_counters,
             gpu_threshold,
             fan_threshold,
@@ -59,9 +66,9 @@ impl FaultTracker {
         }
     }
 
-    /// `read_ok=false` increments the counter; `read_ok=true` resets it.
-    /// Returns `Some(ThermalBlind)` on the call that pushes the counter
-    /// strictly above `gpu_threshold` (PLAN.md: "counter > gpu_fail_threshold").
+    /// Temperature-read path. `read_ok=false` increments; `read_ok=true`
+    /// resets. Returns `Some(GpuNvml)` on the call that pushes the temp
+    /// counter strictly above `gpu_threshold`.
     pub fn tick_gpu(&mut self, gpu_id: &str, read_ok: bool) -> Option<Fault> {
         let counter = self.gpu_counters.entry(gpu_id.to_string()).or_insert(0);
         if read_ok {
@@ -71,7 +78,29 @@ impl FaultTracker {
         *counter += 1;
         if *counter > self.gpu_threshold {
             self.any_fault = true;
-            return Some(Fault::ThermalBlind {
+            return Some(Fault::GpuNvml {
+                gpu_id: gpu_id.to_string(),
+            });
+        }
+        None
+    }
+
+    /// Power-limit path (read OR set). Independent counter from `tick_gpu`,
+    /// same `gpu_threshold`, same `Fault::GpuNvml`. ADR-0008 §FaultTracker
+    /// explains the dilution bug that motivates the split.
+    pub fn tick_gpu_power(&mut self, gpu_id: &str, op_ok: bool) -> Option<Fault> {
+        let counter = self
+            .gpu_power_counters
+            .entry(gpu_id.to_string())
+            .or_insert(0);
+        if op_ok {
+            *counter = 0;
+            return None;
+        }
+        *counter += 1;
+        if *counter > self.gpu_threshold {
+            self.any_fault = true;
+            return Some(Fault::GpuNvml {
                 gpu_id: gpu_id.to_string(),
             });
         }
@@ -230,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn thermal_blind_declared_after_threshold_plus_one_failures() {
+    fn gpu_nvml_declared_after_threshold_plus_one_failures() {
         // Threshold = 3, so the 4th consecutive failure declares the fault.
         // PLAN.md: "counter > gpu_fail_threshold". Off-by-one explicit check.
         let mut t = FaultTracker::new(&ids(&["g0"]), &[], 3, 3);
@@ -240,7 +269,62 @@ mod tests {
         let fault = t.tick_gpu("g0", false); // counter = 4 (> threshold)
         assert_eq!(
             fault,
-            Some(Fault::ThermalBlind {
+            Some(Fault::GpuNvml {
+                gpu_id: "g0".to_string()
+            })
+        );
+        assert!(t.any_fault());
+    }
+
+    // ADR-0008 §FaultTracker — dilution-bug regression.
+    //
+    // Power-limit ticks fire much rarer than temp ticks (every Nth poll, not
+    // every poll). With a single shared counter, a healthy temp tick between
+    // two failing power ticks would reset the counter and a permanently-
+    // broken power path could never declare a fault. We split the counter:
+    // each operation is independently monitored, sharing one threshold and
+    // one fault.
+    #[test]
+    fn power_ok_does_not_reset_temp_counter() {
+        // Critical: tick_gpu_power(ok=true) must NOT touch the temp counter.
+        // Otherwise the dilution bug returns through the back door.
+        let mut t = FaultTracker::new(&ids(&["g0"]), &[], 3, 3);
+        assert_eq!(t.tick_gpu("g0", false), None); // temp counter = 1
+        assert_eq!(t.tick_gpu("g0", false), None); // temp counter = 2
+        assert_eq!(t.tick_gpu_power("g0", true), None); // must NOT reset temp counter
+        assert_eq!(t.tick_gpu("g0", false), None); // temp counter = 3
+        let fault = t.tick_gpu("g0", false); // temp counter = 4 → fault
+        assert!(matches!(fault, Some(Fault::GpuNvml { .. })));
+    }
+
+    #[test]
+    fn temp_ok_does_not_reset_power_counter() {
+        let mut t = FaultTracker::new(&ids(&["g0"]), &[], 3, 3);
+        assert_eq!(t.tick_gpu_power("g0", false), None); // power counter = 1
+        assert_eq!(t.tick_gpu_power("g0", false), None); // power counter = 2
+        assert_eq!(t.tick_gpu("g0", true), None); // must NOT reset power counter
+        assert_eq!(t.tick_gpu_power("g0", false), None); // power counter = 3
+        let fault = t.tick_gpu_power("g0", false); // power counter = 4 → fault
+        assert!(matches!(fault, Some(Fault::GpuNvml { .. })));
+    }
+
+    #[test]
+    fn power_path_declares_fault_despite_alternating_temp_successes() {
+        let mut t = FaultTracker::new(&ids(&["g0"]), &[], 3, 3);
+        // Threshold = 3, so the 4th consecutive power failure declares.
+        // Each power-failure tick is interleaved with a temp-success tick to
+        // simulate the real cadence. With a shared counter this would never
+        // declare; with split counters it must.
+        for _ in 0..3 {
+            assert_eq!(t.tick_gpu("g0", true), None); // temp ok
+            assert_eq!(t.tick_gpu_power("g0", false), None); // power fail (counter 1, 2, 3)
+        }
+        // Fourth power failure crosses threshold.
+        assert_eq!(t.tick_gpu("g0", true), None);
+        let fault = t.tick_gpu_power("g0", false);
+        assert_eq!(
+            fault,
+            Some(Fault::GpuNvml {
                 gpu_id: "g0".to_string()
             })
         );

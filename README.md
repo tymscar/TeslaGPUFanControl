@@ -2,11 +2,17 @@
 
 A Linux daemon that drives motherboard PWM fans from GPU temperature for
 passively-cooled compute cards (e.g. NVIDIA Tesla P100), guarded by the kernel
-hardware watchdog. The safety model — fail-toward-cooling, watchdog-armed
-before PWM takeover, BIOS 100% as the failsafe floor — is captured in
+hardware watchdog. Optionally enforces a per-GPU **Power Limit** for systems
+whose PSU cannot sustain all GPUs at full board power (ADR-0008).
+
+The safety model — fail-toward-cooling, watchdog-armed before PWM takeover,
+BIOS 100% as the failsafe floor — is captured in
 `docs/adr/0001-prioritize-hardware-safety-over-availability.md`,
 `docs/adr/0002-bios-100-percent-as-failsafe-floor.md`, and
-`docs/adr/0003-init-order-watchdog-before-pwm-takeover.md`.
+`docs/adr/0003-init-order-watchdog-before-pwm-takeover.md`. The Power Limit
+feature is documented in
+`docs/adr/0008-power-limit-as-psu-protection-feature.md` and
+`docs/adr/0009-power-limit-not-restored-on-shutdown-by-default.md`.
 
 ## Prerequisites
 
@@ -53,13 +59,38 @@ those into `config/tesla_fan_control.conf` before installing.
 
 ## Validate the config
 
-`--check-config` runs the full static validator (sections S/G/F/W/T in
+`--check-config` runs the full static validator (sections S/G/F/W/P/T in
 `docs/PLAN.md`) without touching hardware and exits non-zero on any
 violation. Safe to run as a non-root user as a pre-flight check.
 
 ```
 tesla_fan_control --check-config -c config/tesla_fan_control.conf
 ```
+
+## Power Limit (PSU protection)
+
+Opt-in per GPU. When enabled the daemon enforces a configured power-management
+limit at startup and re-asserts it every `power_limit_check_interval_s`
+(default 120 s) so external overrides — `nvidia-smi -pl`, driver reloads,
+other tools — are reverted. The intended use case is a multi-GPU box whose
+PSU cannot sustain every card at full board power simultaneously.
+
+```ini
+[gpu:0]
+power_limit_enabled = true
+power_limit_w       = 260
+```
+
+Driver-side feasibility (`power.min_limit` ≤ `power_limit_w` ≤ `power.max_limit`)
+is checked at daemon startup (R6); the daemon refuses to start on violation.
+Power-limit NVML failures count toward the same `gpu_fail_threshold` as
+temperature-read failures and declare the same `Fault::GpuNvml` category, so a
+permanently-broken power path eventually triggers the same fault response as
+a thermal-blind GPU.
+
+A worked PSU-budget example, drift handling, and the SIGHUP / shutdown
+escape hatches are in `docs/CONFIG-TUTORIAL.md` §5 and
+`config/examples/03-with-power-limit.conf`.
 
 ## Install
 
@@ -85,10 +116,12 @@ the daemon last wrote.
 
 ## Config reference
 
-The canonical configuration schema, validation rules (S/G/F/W/T/R), and
-SIGHUP reload policy live in `docs/PLAN.md` under §Configuration File Format
-and §Configuration Validation. `config/tesla_fan_control.conf` is a working
-template.
+The canonical configuration schema, validation rules (S/G/F/W/P/T static,
+R runtime), and SIGHUP reload policy live in `docs/PLAN.md` under
+§Configuration File Format and §Configuration Validation.
+`config/tesla_fan_control.conf` is a working template; three worked
+examples live under `config/examples/`. The end-to-end calibration walkthrough
+is in `docs/CONFIG-TUTORIAL.md`.
 
 ## Rebuild and reinstall
 
