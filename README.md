@@ -35,14 +35,24 @@ feature is documented in
 
 ## Build
 
-The release binary is a static musl build so it can run on any x86_64 Linux
-without a glibc dependency. The toolchain is pinned by `rust-toolchain.toml`
-(channel 1.85, target `x86_64-unknown-linux-musl`).
+The toolchain is pinned by `rust-toolchain.toml` (channel 1.85, target
+`x86_64-unknown-linux-musl`).
 
 ```
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
+
+`.cargo/config.toml` disables `-crt-static` for the musl target because
+NVML (`libnvidia-ml.so.1`) is `dlopen`-loaded at runtime by the
+`nvml-wrapper` crate, which a fully-static binary cannot do (musl's
+static libc has no `dlopen`). The release artifact is therefore
+dynamically linked. The CI release pipeline runs in a container with a
+full musl cross-toolchain, producing an artifact linked against musl
+libc; a local `cargo build` on a Debian/Ubuntu box without that
+toolchain falls back to the system linker and ships a binary linked
+against glibc instead. Both work on the target box as long as the
+matching libc is present (every modern Linux ships glibc).
 
 ## Calibrate (run first)
 
