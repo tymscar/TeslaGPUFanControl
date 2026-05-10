@@ -99,6 +99,41 @@ impl Fan {
         std::fs::write(&path, contents).map_err(|source| FanError::Write { path, source })
     }
 
+    /// Verify `pwm_enable` is still in manual mode and re-arm it if not.
+    ///
+    /// Kernel hwmon drivers commonly re-initialise the chip on resume from
+    /// suspend, resetting `pwm_enable` from the daemon's `1` (manual) back
+    /// to the BIOS-auto value. Without this guard the daemon keeps writing
+    /// duty values that the chip silently ignores while BIOS-auto runs the
+    /// fan at 100 % (ADR-0002). Called on every `set()` / `set_max()` so
+    /// recovery is automatic on the next poll.
+    ///
+    /// On re-arm we also re-enter spin-up grace because the chip was just
+    /// running a different duty for an unknown duration; the next RPM read
+    /// must not be classified as Stalled before the fan can spool back up.
+    /// The original startup snapshot in `pwm_enable_snapshot` is **not**
+    /// touched — restore-on-shutdown still writes the BIOS value back.
+    fn ensure_manual_mode(&mut self) -> Result<(), FanError> {
+        let path = self.pwm_enable_path();
+        let raw = std::fs::read_to_string(&path).map_err(|source| FanError::Read {
+            path: path.clone(),
+            source,
+        })?;
+        let cur = raw.trim();
+        if cur == "1" {
+            return Ok(());
+        }
+        tracing::warn!(
+            hwmon = %self.hwmon_path.display(),
+            pwm_channel = self.pwm_channel,
+            observed_pwm_enable = cur,
+            "pwm_enable drifted from manual mode; re-arming and re-entering spin-up grace (suspend/resume?)"
+        );
+        Self::write_sysfs(self.pwm_enable_path(), "1")?;
+        self.spin_up_state = SpinUpState::Active { elapsed_s: 0 };
+        Ok(())
+    }
+
     /// Snapshot the current `pwm_enable` value verbatim, then force manual
     /// mode (`"1"`) and enter spin-up grace. The snapshot is whatever bytes
     /// the kernel returned (after trim) — round-tripped exactly by
@@ -118,6 +153,7 @@ impl Fan {
     }
 
     pub fn set(&mut self, pct: Pct) -> Result<(), FanError> {
+        self.ensure_manual_mode()?;
         let pwm = Pwm::from(pct);
         Self::write_sysfs(self.pwm_path(), &pwm.0.to_string())?;
         if let Some(last) = self.last_set_pct {
@@ -135,6 +171,7 @@ impl Fan {
     /// re-trigger spin-up via the delta path; spin-up is entered here
     /// because a max-duty jump is itself a large duty change.
     pub fn set_max(&mut self) -> Result<(), FanError> {
+        self.ensure_manual_mode()?;
         Self::write_sysfs(self.pwm_path(), "255")?;
         self.last_set_pct = Some(Pct(100));
         self.spin_up_state = SpinUpState::Active { elapsed_s: 0 };
@@ -313,6 +350,78 @@ mod tests {
 
         let err = fan.restore().unwrap_err();
         assert!(matches!(err, FanError::NoSnapshot));
+    }
+
+    // Suspend/resume regression — kernel hwmon drivers re-initialise the PWM
+    // controller on resume, resetting pwm_enable from "1" back to its BIOS-auto
+    // value. The daemon never re-arms, so subsequent `set()` calls write to
+    // `pwm{N}` but the chip ignores them (it's in auto mode → BIOS 100 %).
+    //
+    // After this test exists, set() must observe drift and rewrite pwm_enable=1
+    // before writing the duty. The duty must take effect on the very next poll.
+    #[test]
+    fn set_re_arms_pwm_enable_when_drifted() {
+        let dir = tempdir().unwrap();
+        make_hwmon_with_channel(dir.path(), 1, "5\n");
+        let mut fan = Fan::open(dir.path().to_path_buf(), 1, 200, 3000, 10);
+
+        fan.take_manual_control().unwrap();
+        // Simulate a kernel-driven reset (suspend/resume): pwm_enable goes
+        // back to BIOS-auto while the daemon still believes it owns the fan.
+        fs::write(dir.path().join("pwm1_enable"), "5\n").unwrap();
+
+        fan.set(Pct(20)).unwrap();
+
+        // Observable: pwm_enable is back to "1", and the duty for 20 % (51) is
+        // in pwm1. Without re-arm, pwm_enable stays "5" and the duty write is
+        // silently ignored by the hardware.
+        let pwm_enable = fs::read_to_string(dir.path().join("pwm1_enable")).unwrap();
+        let pwm = fs::read_to_string(dir.path().join("pwm1")).unwrap();
+        assert_eq!(
+            pwm_enable.trim(),
+            "1",
+            "pwm_enable should have been re-armed"
+        );
+        assert_eq!(pwm, "51", "duty for 20 % should be 51");
+    }
+
+    #[test]
+    fn set_max_re_arms_pwm_enable_when_drifted() {
+        // set_max is the fault response; it must also recover from drift.
+        let dir = tempdir().unwrap();
+        make_hwmon_with_channel(dir.path(), 1, "5\n");
+        let mut fan = Fan::open(dir.path().to_path_buf(), 1, 200, 3000, 10);
+
+        fan.take_manual_control().unwrap();
+        fs::write(dir.path().join("pwm1_enable"), "5\n").unwrap();
+
+        fan.set_max().unwrap();
+
+        let pwm_enable = fs::read_to_string(dir.path().join("pwm1_enable")).unwrap();
+        let pwm = fs::read_to_string(dir.path().join("pwm1")).unwrap();
+        assert_eq!(pwm_enable.trim(), "1");
+        assert_eq!(pwm, "255");
+    }
+
+    #[test]
+    fn set_re_enters_spin_up_grace_after_drift_recovery() {
+        // After re-arming, the fan was just put back under daemon control —
+        // the previous spin-up state machine is meaningless because the chip
+        // was running a different duty for an unknown duration. Re-enter
+        // grace so the next RPM read isn't classified as Stalled before the
+        // fan has a chance to spool back up to the daemon's target.
+        let dir = tempdir().unwrap();
+        make_hwmon_with_channel(dir.path(), 1, "5\n");
+        let mut fan = Fan::open(dir.path().to_path_buf(), 1, 200, 3000, 10);
+
+        fan.take_manual_control().unwrap();
+        fan.tick_spin_up(300, 0); // Exit initial spin-up cleanly.
+                                  // Drift, then a small set that wouldn't normally enter spin-up.
+        fs::write(dir.path().join("pwm1_enable"), "5\n").unwrap();
+        fan.set(Pct(20)).unwrap();
+
+        // Below min_rpm must surface as SpinUp, not Stalled.
+        assert_eq!(fan.check_health(50), FanHealth::SpinUp);
     }
 
     #[test]

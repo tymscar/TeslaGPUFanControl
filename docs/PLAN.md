@@ -364,6 +364,8 @@ Uninstall recommendation: after `uninstall.sh` removes the service, reboot the b
 
 **RPM read timing note:** RPM is read *after* each PWM write. After a large speed increase the fan takes time to spin up; the `fan_fail_threshold` consecutive-failure window absorbs transient low readings during ramp-up and prevents false alarms.
 
+**Suspend/resume drift recovery.** Linux hwmon drivers (nct6775, it87, …) commonly re-initialise the PWM controller on resume, resetting `pwm{N}_enable` from the daemon's `1` back to the BIOS-auto value. Without recovery the daemon keeps writing duty to `pwm{N}` while BIOS-auto runs the fan at 100 % — silent failure. `Fan::set` and `Fan::set_max` therefore call `ensure_manual_mode` first: read `pwm{N}_enable`, and if it is not `1`, log a WARN with the observed value, rewrite `1`, and re-enter spin-up grace (the chip was just running a different duty for an unknown duration; the next RPM read must not be classified as Stalled before the fan can spool back up). The startup snapshot in `pwm_enable_snapshot` is *not* rewritten — restore-on-shutdown still puts the original BIOS value back.
+
 ### `curve.rs`
 - `Curve` holds `Vec<(Celsius, Pct)>`, max 10 points, sorted ascending by temp.
 - `Curve::evaluate(temp: Celsius) -> Pct` — linear interpolation, clamped at the edges.

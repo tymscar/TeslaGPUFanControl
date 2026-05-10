@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fans stuck at 100 % after resume from system suspend. Kernel hwmon
+  drivers re-initialise the PWM controller on resume, resetting
+  `pwm{N}_enable` from `1` (manual, daemon-owned) back to the BIOS-auto
+  value. The daemon kept writing duty values to `pwm{N}` but the chip
+  silently ignored them while BIOS-auto ran the fan at 100 %. `Fan::set`
+  / `Fan::set_max` now check `pwm{N}_enable` on every poll and re-arm it
+  to `1` if it has drifted, logging a WARN with the observed value and
+  re-entering spin-up grace. The startup snapshot used by
+  `Fan::restore` on graceful shutdown is preserved unchanged.
+
 ### Added
 
 - Per-GPU **Power Limit** enforcement via NVML. Opt-in per GPU
