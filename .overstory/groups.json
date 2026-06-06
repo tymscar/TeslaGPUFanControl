@@ -1,0 +1,15 @@
+[
+	{
+		"id": "group-74268947",
+		"name": "tesla-fan-control-v0.1",
+		"memberIssueIds": [
+			"TeslaGPUFanControl-0062",
+			"TeslaGPUFanControl-ee00",
+			"TeslaGPUFanControl-4432",
+			"TeslaGPUFanControl-e462"
+		],
+		"status": "completed",
+		"createdAt": "2026-05-03T14:10:12.478Z",
+		"completedAt": "2026-05-03T16:31:53.521Z"
+	}
+]
